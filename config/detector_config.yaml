@@ -14,9 +14,9 @@ blink:
 # Yawn Detection
 yawn:
   threshold_sec: 0.27             # Time with mouth open to detect yawn
-  cooldown_sec: 2.0               # Cooldown before next yawn
+  cooldown_sec: 2.0               # Cooldown before next yawn can be logged
 
-# Expression Suppression
+# Expression Suppression (prevent false drowsiness during smiles/laughs)
 expression:
   smile_suppress_sec: 0.5         # Suppress drowsiness after smile
   laugh_suppress_sec: 0.67        # Suppress drowsiness after laugh
@@ -27,5 +27,10 @@ user:
 
 # Image Quality
 image:
-  local_quality: 85               # JPEG quality for local SQLite
-  remote_quality: 70              # JPEG quality for remote server
+  local_quality: 85               # JPEG quality for local SQLite (0-100)
+  remote_quality: 70              # JPEG quality for remote server (0-100)
+
+# System Settings
+system:
+  vin: "VIN-0001"
+  target_fps: 30.0

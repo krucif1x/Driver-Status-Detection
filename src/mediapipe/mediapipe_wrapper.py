@@ -1,0 +1,51 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+
+class MediaPipeFaceModel:
+    """
+    A wrapper for the MediaPipe Face Mesh solution.
+    Handles initialization, preprocessing, and inference.
+    """
+    def __init__(
+        self,
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ):
+        # Initialize the MediaPipe Face Mesh solution
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=static_image_mode,
+            max_num_faces=max_num_faces,
+            refine_landmarks=refine_landmarks,
+            min_detection_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence
+        )
+
+    def preprocess(self, image: np.ndarray) -> np.ndarray:
+        """
+        Convert the image from BGR (OpenCV default) to RGB (MediaPipe requirement).
+        """
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    def process(self, image: np.ndarray):
+        """
+        Run the model on an image.
+        
+        Returns:
+            The raw MediaPipe results object (containing multi_face_landmarks).
+        """
+        # 1. Convert color space
+        rgb_image = self.preprocess(image)
+        
+        # 2. Run inference
+        results = self.face_mesh.process(rgb_image)
+        
+        return results
+
+    def close(self):
+        """Release resources."""
+        self.face_mesh.close()
