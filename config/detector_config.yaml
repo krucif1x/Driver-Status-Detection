@@ -1,0 +1,31 @@
+# Drowsiness Detector Configuration
+# All time-based thresholds in SECONDS (converted to frames at runtime)
+
+# Episode Detection
+drowsiness:
+  start_threshold_sec: 0.5        # Time of low EAR to START episode
+  end_grace_sec: 1.5              # Time of normal EAR to END episode
+  min_episode_sec: 2.0            # Minimum episode duration to log
+  
+# Blink Detection
+blink:
+  closed_frames: 2                # Frames with eyes closed = 1 blink
+
+# Yawn Detection
+yawn:
+  threshold_sec: 0.27             # Time with mouth open to detect yawn
+  cooldown_sec: 2.0               # Cooldown before next yawn
+
+# Expression Suppression
+expression:
+  smile_suppress_sec: 0.5         # Suppress drowsiness after smile
+  laugh_suppress_sec: 0.67        # Suppress drowsiness after laugh
+
+# User Recognition
+user:
+  swap_threshold: 0.8             # Face encoding distance for user swap
+
+# Image Quality
+image:
+  local_quality: 85               # JPEG quality for local SQLite
+  remote_quality: 70              # JPEG quality for remote server
