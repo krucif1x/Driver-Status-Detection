@@ -51,10 +51,16 @@ class DrowsinessDetector:
         self.user = None
         self.dynamic_ear_threshold = 0.22
         self._last_frame_rgb = None
-        self.counters = {'DROWSINESS_FRAMES': 0, 'DROWSY_RECOVERY_FRAMES': 0, 'YAWN_FRAMES': 0, 'YAWN_COOLDOWN': 0, 'BLINK_COUNT': 0, 'EYE_CLOSED_FRAMES': 0, 'SMILE_SUPPRESS_COUNTER': 0, 'LAUGH_SUPPRESS_COUNTER': 0}
+        self.counters = {
+            'DROWSINESS_FRAMES': 0, 'DROWSY_RECOVERY_FRAMES': 0, 
+            'YAWN_FRAMES': 0, 'YAWN_COOLDOWN': 0, 'BLINK_COUNT': 0, 
+            'EYE_CLOSED_FRAMES': 0, 'SMILE_SUPPRESS_COUNTER': 0, 
+            'LAUGH_SUPPRESS_COUNTER': 0,
+            'HAND_OVER_MOUTH_FRAMES': 0 # NEW COUNTER
+        }
         self.episode = {'active': False, 'start_time': None, 'start_frame_rgb': None, 'min_ear': 1.0, 'max_ear': 0.0}
         self.states = {'IS_DROWSY': False, 'IS_YAWNING': False}
-
+        
     def set_last_frame(self, frame, color_space="RGB"):
         if frame is not None: self._last_frame_rgb = frame.copy()
 
@@ -66,11 +72,11 @@ class DrowsinessDetector:
         self.states = {k: False for k in self.states}
         self.logger.stop_alert()
 
-    def detect(self, current_ear, mar, mouth_expression):
+    def detect(self, current_ear, mar, mouth_expression, hands_data=None, face_center_norm=None):
         self._update_expression_suppression(mouth_expression)
         self._update_blink_counter(current_ear)
         self._update_drowsiness_episode(current_ear)
-        self._update_yawn_state(mar, mouth_expression)
+        self._update_yawn_state(mar, mouth_expression, hands_data, face_center_norm)
         
         if self.states['IS_DROWSY']:
             self.logger.alert("critical")
@@ -123,12 +129,36 @@ class DrowsinessDetector:
             if self.counters['EYE_CLOSED_FRAMES'] >= self.config.blink_closed_frames: self.counters['BLINK_COUNT'] += 1
             self.counters['EYE_CLOSED_FRAMES'] = 0
 
-    def _update_yawn_state(self, mar, expr):
+    def _update_yawn_state(self, mar, expr, hands_data, face_center_norm):
         if self.counters['YAWN_COOLDOWN'] > 0: self.counters['YAWN_COOLDOWN'] -= 1
-        self.counters['YAWN_FRAMES'] = (self.counters['YAWN_FRAMES'] + 1) if expr == "YAWN" else 0
-        is_yawning = self.counters['YAWN_FRAMES'] >= self.config.yawn_threshold_frames
+        
+        is_hand_covering_mouth = False
+        if hands_data and face_center_norm:
+            fx, fy = face_center_norm
+            for hand_landmarks in hands_data:
+                # Check Middle Finger MCP (Index 9) or Wrist (0) distance to Nose
+                # Simple distance check: < 0.15 normalized units implies hand is ON face
+                hx, hy, _ = hand_landmarks[9] 
+                dist = ((hx - fx)**2 + (hy - fy)**2)**0.5
+                if dist < 0.15:
+                    is_hand_covering_mouth = True
+                    break
+
+        # Trigger yawn if:
+        # 1. MAR/Expression says YAWN
+        # 2. OR Hand is covering mouth AND Expression isn't explicitly "Smile/Laugh"
+        is_yawning_signal = (expr == "YAWN") or (is_hand_covering_mouth and expr not in ["SMILE", "LAUGH"])
+        
+        self.counters['YAWN_FRAMES'] = (self.counters['YAWN_FRAMES'] + 1) if is_yawning_signal else 0
+        
+        # We might want a slightly shorter threshold for hand-yawns as they are harder to catch
+        threshold = self.config.yawn_threshold_frames
+        
+        is_yawning = self.counters['YAWN_FRAMES'] >= threshold
         
         if is_yawning and not self.states['IS_YAWNING'] and self.counters['YAWN_COOLDOWN'] == 0:
-            self.logger.log_event(self.user.user_id if self.user else 0, "YAWN", 0.0, mar, self._last_frame_rgb)
+            event_type = "YAWN_COVERED" if is_hand_covering_mouth else "YAWN"
+            self.logger.log_event(self.user.user_id if self.user else 0, event_type, 0.0, mar, self._last_frame_rgb)
             self.counters['YAWN_COOLDOWN'] = self.config.yawn_cooldown_frames
+        
         self.states['IS_YAWNING'] = is_yawning
