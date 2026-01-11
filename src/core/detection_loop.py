@@ -1,6 +1,5 @@
 import logging
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import cv2
 
@@ -14,81 +13,88 @@ from src.mediapipe.head_pose import HeadPoseEstimator
 from src.utils.constants import L_EAR, M_MAR, R_EAR
 from src.utils.ui.metrics_tracker import FpsTracker, RollingAverage
 from src.utils.ui.visualization import Visualizer
+from src.utils.calibration.calculation import MAR
 
-# from archive.fainting import FaintingDetector  # fainting removed from loop
+from src.core.frame_processing import FrameProcessor, HandsPipeline
 
 log = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class FrameFeatures:
-    h: int
-    w: int
-    pitch: float
-    yaw: float
-    roll: float
-    lms_px: List[Tuple[int, int]]
-    face_center_norm: Tuple[float, float]
-    avg_ear: float
-    mar: float
-
-
 class DetectionLoop:
-    def __init__(self, camera, face_mesh, buzzer, user_manager, system_logger, vehicle_vin, fps, detector_config_path, initial_user_profile=None, **kwargs):
+    def __init__(
+        self,
+        camera,
+        face_mesh,
+        buzzer,
+        user_manager,
+        system_logger,
+        vehicle_vin,
+        fps,
+        detector_config_path,
+        initial_user_profile=None,
+        **kwargs,
+    ):
         self.camera = camera
         self.face_mesh = face_mesh
         self.user_manager = user_manager
         self.logger = system_logger
+
+        # UI kept separate (Visualizer handles drawing only)
         self.visualizer = Visualizer()
+
+        # Calibration (inject logger for optional buzzer signals)
+        self.ear_calibrator = EARCalibrator(self.camera, self.face_mesh, self.user_manager, system_logger=self.logger)
+
+        # IMPORTANT: initialize cooldown fields
         self._post_calibration_cooldown = 0
+        self._identity_prompted = False
+        self._event_beep_cooldown = 0
 
-        # Initialize Core Calibrator
-        self.ear_calibrator = EARCalibrator(self.camera, self.face_mesh, self.user_manager)
-
-        # Initialize Detectors
+        # Identity prompt control + event cooldown (prevents buzzing every frame)
         self.detector = DrowsinessDetector(self.logger, fps, detector_config_path)
-
         self.distraction_detector = DistractionDetector(
             fps=fps,
             camera_pitch=0.0,
             camera_yaw=0.0,
             config_path=detector_config_path,
         )
-
-        # Fainting detector removed from loop
-        # self.fainting_detector = FaintingDetector(...)
-
         self.detector.set_last_frame(None)
 
         self.head_pose_estimator = HeadPoseEstimator()
         self.expression_classifier = MouthExpressionClassifier()
 
-        # Hand Wrapper (Max 2 hands)
+        # Hands: infer on interval; cache normalized hands
         self.hand_wrapper = MediaPipeHandsWrapper(max_num_hands=2)
+        self.hands_pipeline = HandsPipeline(self.hand_wrapper, inference_interval_frames=5)
 
         self.fps_tracker = FpsTracker()
         self.ear_smoother = RollingAverage(1.0, fps)
+        self.mar_calculator = MAR()
+
+        # Frame math extracted out of DetectionLoop
+        self.frame_processor = FrameProcessor(
+            head_pose_estimator=self.head_pose_estimator,
+            ear_calculator=self.ear_calibrator.ear_calculator,
+            mar_calculator=self.mar_calculator,
+            ear_smoother=self.ear_smoother,
+            indices_left_ear=L_EAR,
+            indices_right_ear=R_EAR,
+            indices_mouth=M_MAR,
+        )
 
         self.user = initial_user_profile
         self.current_mode = "DETECTING" if initial_user_profile else "WAITING_FOR_USER"
-
         if self.user:
             self.detector.set_active_user(self.user)
 
         self._frame_idx = 0
         self._show_debug_deltas = False
 
-        # Buffer to prevent instant calibration
         self.recognition_patience = 0
         self.RECOGNITION_THRESHOLD = 45
 
-        # --- OPTIMIZATION VARIABLES ---
-        self.HAND_INFERENCE_INTERVAL = 5
-        self.USER_SEARCH_INTERVAL = 30
-        self._cached_hands_data = []
-
     def run(self):
-        log.info("Starting Optimized Detection Loop...")
+        log.info("Starting Detection Loop...")
         try:
             while True:
                 self.process_frame()
@@ -99,151 +105,62 @@ class DetectionLoop:
                 elif key == ord("d"):
                     self._show_debug_deltas = not self._show_debug_deltas
         finally:
-            self.hand_wrapper.close()
+            try:
+                self.hand_wrapper.close()
+            except Exception:
+                pass
+            try:
+                if hasattr(self.logger, "stop_alert"):
+                    self.logger.stop_alert()
+            except Exception:
+                pass
             cv2.destroyAllWindows()
             self.camera.release()
 
     def process_frame(self):
-        frame = self.camera.read()
-        if frame is None:
+        # UI wants BGR; MediaPipe wants RGB. Keep BGR as "source of truth".
+        frame_bgr = self.camera.read(color="bgr")
+        if frame_bgr is None:
             return
+
+        # One-time identity prompt beep (safe if buzzer absent)
+        if self.current_mode == "WAITING_FOR_USER" and not self._identity_prompted:
+            try:
+                if hasattr(self.logger, "signal"):
+                    self.logger.signal("identity_prompt")
+            except Exception:
+                pass
+            self._identity_prompted = True
+        if self.current_mode == "DETECTING":
+            self._identity_prompted = False
+
+        if self._event_beep_cooldown > 0:
+            self._event_beep_cooldown -= 1
 
         self._frame_idx += 1
         fps = self.fps_tracker.update()
+        h, w = frame_bgr.shape[:2]
 
-        results = self.face_mesh.process(frame)
+        # Convert ONCE per frame for MediaPipe
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        # Hand inference (every N frames)
-        if self._frame_idx % self.HAND_INFERENCE_INTERVAL == 0:
-            self._cached_hands_data = self.hand_wrapper.infer(frame, preprocessed=True)
-        hands_data = self._cached_hands_data
+        results = self.face_mesh.process(frame_rgb)
 
-        display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        # Hands: infer+normalize on interval (cached normalized output)
+        hands_norm = self.hands_pipeline.step(frame_rgb, w, h)
+
+        # Display in BGR (no conversion needed)
+        display = frame_bgr
 
         if self.current_mode == "WAITING_FOR_USER":
-            self.face_recognition(frame, display, results)
+            self.face_recognition(frame_rgb, display, results)
         elif self.current_mode == "DETECTING":
-            self.detection(frame, display, results, hands_data, fps)
+            self.detection(frame_rgb, display, results, hands_norm, fps)
 
-        # UI overlay handled by Visualizer (not DetectionLoop)
         self.visualizer.draw_mode(display, self.current_mode)
-
         cv2.imshow("Drowsiness System", display)
 
-    def _extract_features(self, frame, results) -> Optional[FrameFeatures]:
-        if not results.multi_face_landmarks:
-            return None
-
-        h, w = frame.shape[:2]
-        raw_lms = results.multi_face_landmarks[0]
-
-        # Face detection confidence -> feeds DistractionDetector (state)
-        face_confidence = 1.0
-        if hasattr(raw_lms.landmark[0], "visibility"):
-            face_confidence = raw_lms.landmark[0].visibility
-        self.distraction_detector.set_face_visibility(face_confidence)
-
-        # Head pose (degrees)
-        pose = self.head_pose_estimator.calculate_pose(raw_lms, w, h)
-        pitch, yaw, roll = pose if pose else (0.0, 0.0, 0.0)
-
-        # Landmarks (pixels)
-        lms_px = [(int(l.x * w), int(l.y * h)) for l in raw_lms.landmark]
-        coords = {
-            "left_eye": [lms_px[i] for i in L_EAR],
-            "right_eye": [lms_px[i] for i in R_EAR],
-            "mouth": [lms_px[i] for i in M_MAR],
-        }
-
-        # Face center (normalized)
-        nose_tip = raw_lms.landmark[1]
-        face_center_norm = (nose_tip.x, nose_tip.y)
-
-        # Metrics
-        left = self.ear_calibrator.ear_calculator.calculate(coords["left_eye"])
-        right = self.ear_calibrator.ear_calculator.calculate(coords["right_eye"])
-        ear = (left + right) / 2.0
-        avg_ear = self.ear_smoother.update(ear)
-
-        # MAR
-        # Note: EARCalibrator already has calculators; keep MAR calculator local where it’s used.
-        # Existing code used self.mar_calculator; avoid re-adding unused fields.
-        # Compute MAR via the same MAR utility as before if present elsewhere; keeping current pattern:
-        from src.utils.calibration.calculation import MAR  # local import to keep init slim
-        mar_calc = MAR()
-        mar = mar_calc.calculate(coords["mouth"])
-
-        return FrameFeatures(
-            h=h,
-            w=w,
-            pitch=float(pitch),
-            yaw=float(yaw),
-            roll=float(roll),
-            lms_px=lms_px,
-            face_center_norm=face_center_norm,
-            avg_ear=float(avg_ear),
-            mar=float(mar),
-        )
-
-    def _normalize_hands(self, hands_data, w: int, h: int):
-        """
-        Return hands normalized to 0..1, keeping (x,y,z) when available.
-        Output format: List[hand], where hand is List[(x_norm, y_norm, z_norm)].
-        """
-        if not hands_data or w <= 0 or h <= 0:
-            return []
-
-        inv_w = 1.0 / float(w)
-        inv_h = 1.0 / float(h)
-
-        norm_hands = []
-        for hand in hands_data:
-            if not hand:
-                continue
-
-            # Heuristic: if values already look normalized, pass through.
-            try:
-                x0 = hand[0][0]
-                y0 = hand[0][1]
-                already_norm = 0.0 <= float(x0) <= 1.0 and 0.0 <= float(y0) <= 1.0
-            except Exception:
-                already_norm = False
-
-            if already_norm:
-                # Ensure (x,y,z) tuples
-                norm_hand = []
-                for pt in hand:
-                    try:
-                        if len(pt) >= 3:
-                            norm_hand.append((float(pt[0]), float(pt[1]), float(pt[2])))
-                        else:
-                            norm_hand.append((float(pt[0]), float(pt[1]), 0.0))
-                    except Exception:
-                        continue
-                if norm_hand:
-                    norm_hands.append(norm_hand)
-                continue
-
-            # Otherwise assume pixel coords and normalize
-            norm_hand = []
-            for pt in hand:
-                try:
-                    x = float(pt[0]) * inv_w
-                    y = float(pt[1]) * inv_h
-                    z = float(pt[2]) if len(pt) >= 3 else 0.0
-                    norm_hand.append((x, y, z))
-                except Exception:
-                    continue
-            if norm_hand:
-                norm_hands.append(norm_hand)
-
-        return norm_hands
-
-    def _run_detectors(self, frame, features: FrameFeatures, hands_data):
-        # Normalize hands ONCE per frame, reuse everywhere
-        hands_norm = self._normalize_hands(hands_data, features.w, features.h)
-
-        # Expression (pass img_w to avoid guessing)
+    def _run_detectors(self, frame, features, hands_norm):
         expr = self.expression_classifier.classify(
             features.lms_px,
             features.h,
@@ -251,20 +168,21 @@ class DetectionLoop:
             img_w=features.w,
         )
 
-        # Drowsiness (also use normalized hands so downstream math is consistent)
         self.detector.set_last_frame(frame)
+
+        # IMPORTANT: use raw EAR for decisions; keep avg_ear for HUD only
         drowsy_status, drowsy_color = self.detector.detect(
-            features.avg_ear,
+            features.ear_raw,
             features.mar,
             expr,
             hands_data=hands_norm,
             face_center=features.face_center_norm,
             pitch=features.pitch,
         )
+
         drowsy_state = self.detector.get_detailed_state()
         is_drowsy = bool(drowsy_state.get("is_drowsy", False))
 
-        # Distraction (reuse normalized hands)
         is_distracted, should_log_distraction, distraction_info = self.distraction_detector.analyze(
             features.pitch,
             features.yaw,
@@ -286,15 +204,16 @@ class DetectionLoop:
             "distraction_type": getattr(self.distraction_detector, "distraction_type", "NORMAL"),
         }
 
-    def detection(self, frame, display, results, hands_data, fps):
-        features = self._extract_features(frame, results)
+    def detection(self, frame, display, results, hands_norm, fps):
+        features = self.frame_processor.extract(frame, results)
         if features is None:
-            # Update face visibility tracker even when no face detected
             self.distraction_detector.set_face_visibility(0.0)
             self.visualizer.draw_no_face_text(display)
             return
 
-        out = self._run_detectors(frame, features, hands_data)
+        self.distraction_detector.set_face_visibility(features.face_confidence)
+
+        out = self._run_detectors(frame, features, hands_norm)
 
         final = StatusAggregator.aggregate(
             drowsy_status=out["drowsy_status"],
@@ -305,9 +224,22 @@ class DetectionLoop:
             distraction_info=out["distraction_info"],
         )
 
-        # Optional logging (distraction only; fainting removed)
+        # Buzzer on DROWSY state (rate-limited)
+        if out.get("is_drowsy") and self._event_beep_cooldown == 0:
+            try:
+                if hasattr(self.logger, "signal"):
+                    self.logger.signal("drowsy")
+            except Exception:
+                pass
+            self._event_beep_cooldown = int(max(1, fps * 2))
+
         if final.should_log_distraction:
-            self.logger.alert("distraction")
+            try:
+                if hasattr(self.logger, "signal"):
+                    self.logger.signal("distraction")
+            except Exception:
+                pass
+
             user_id = getattr(self.user, "user_id", 0)
             self.logger.log_event(
                 user_id,
@@ -327,7 +259,7 @@ class DetectionLoop:
             final.label,
             final.color_bgr,
             fps,
-            features.avg_ear,
+            features.avg_ear,  # display smoothed
             features.mar,
             0,
             out["expr"],
@@ -335,10 +267,12 @@ class DetectionLoop:
         )
 
     def face_recognition(self, frame, display, results):
-        if hasattr(self, "_post_calibration_cooldown") and self._post_calibration_cooldown > 0:
+        # Safe even if attribute somehow missing
+        self._post_calibration_cooldown = int(getattr(self, "_post_calibration_cooldown", 0))
+        if self._post_calibration_cooldown > 0:
             self._post_calibration_cooldown -= 1
 
-        if not results.multi_face_landmarks:
+        if not results or not getattr(results, "multi_face_landmarks", None):
             self.visualizer.draw_no_user_text(display)
             self.recognition_patience = 0
             return
@@ -364,20 +298,24 @@ class DetectionLoop:
 
     def calibration(self, frame):
         log.info("Starting Calibration...")
-        self.logger.stop_alert()
+        try:
+            if hasattr(self.logger, "stop_alert"):
+                self.logger.stop_alert()
+        except Exception:
+            pass
 
         result_threshold = self.ear_calibrator.calibrate()
 
         try:
             cv2.destroyWindow("Calibration")
-        except:
+        except Exception:
             pass
 
         if result_threshold is not None and isinstance(result_threshold, float):
             log.info(f"Calibration Success. Threshold: {result_threshold:.3f}")
 
             new_id = len(self.user_manager.users) + 1
-            fresh_frame = self.camera.read()
+            fresh_frame = self.camera.read(color="rgb")
             if fresh_frame is None:
                 fresh_frame = frame
 

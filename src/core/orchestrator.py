@@ -62,6 +62,13 @@ class DrowsinessSystem:
         self.buzzer = Buzzer(pin=18)
         self.system_logger = SystemLogger(self.buzzer, self.remote_worker, self.repo, self.vin)
         
+        # Notify system logger about startup
+        try:
+            if hasattr(self, "system_logger") and self.system_logger:
+                self.system_logger.signal("startup")
+        except Exception:
+            pass
+            
         # 3. Hardware
         self.camera = Camera(source='auto', resolution=(640, 480))
         if not self.camera.ready:

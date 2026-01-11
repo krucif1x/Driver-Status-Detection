@@ -25,10 +25,11 @@ class EARCalibrator:
     STABILITY_WINDOW = 20
     PREALLOCATE_SIZE = 300
 
-    def __init__(self, camera, face_mesh, user_manager: UserManager):
+    def __init__(self, camera, face_mesh, user_manager: UserManager, system_logger=None):
         self.camera = camera
         self.face_mesh = face_mesh
         self.user_manager = user_manager
+        self.logger = system_logger  # optional
         self.ear_calculator = EAR()
         self._ear_buffer = np.zeros(self.PREALLOCATE_SIZE, dtype=np.float32)
         self._ear_count = 0
@@ -45,6 +46,11 @@ class EARCalibrator:
             - None: If calibration failed/cancelled
         """
         print(f"\n--- EAR Calibration: Look at the camera for {self.CALIBRATION_DURATION_S} seconds. ---")
+
+        # Requirement 1: prompt driver to stare at camera
+        if self.logger:
+            self.logger.signal("calibration_prompt")
+
         time.sleep(1.0)
 
         self._ear_count = 0
@@ -77,7 +83,12 @@ class EARCalibrator:
                         self._user_check_queue.put(feedback_frame.copy())
 
                 if self._user_check_result is not None:
-                    print(f"Recognized user '{getattr(self._user_check_result, 'full_name', self._user_check_result.user_id)}' detected.")
+                    print(
+                        f"Recognized user '{getattr(self._user_check_result, 'full_name', self._user_check_result.user_id)}' detected."
+                    )
+                    # treat as success feedback (identity found)
+                    if self.logger:
+                        self.logger.signal("calibration_success")
                     return ('user_swap', self._user_check_result)
 
                 rgb_frame = feedback_frame
@@ -89,6 +100,8 @@ class EARCalibrator:
                         face_lost_start_time = time.time()
                     elif time.time() - face_lost_start_time > face_lost_timeout:
                         print("Calibration failed: Face was not detected for too long.")
+                        if self.logger:
+                            self.logger.signal("calibration_fail")
                         return None
                 else:
                     face_lost_start_time = None
@@ -100,12 +113,19 @@ class EARCalibrator:
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27:  # ESC
                     print("Calibration cancelled by user.")
+                    if self.logger:
+                        self.logger.signal("calibration_fail")
                     return None
 
         finally:
             self.manage_user_check_thread(start=False)
 
-        return self.average_ear()
+        result = self.average_ear()
+        if isinstance(result, float) and self.logger:
+            self.logger.signal("calibration_success")
+        elif self.logger:
+            self.logger.signal("calibration_fail")
+        return result
 
     def manage_user_check_thread(self, start=True):
         if start:

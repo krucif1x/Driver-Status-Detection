@@ -138,25 +138,39 @@ class Camera:
             log.error("Failed to init OpenCV at index %d: %s", idx_to_try, e)
             return False
     
-    def read(self) -> Optional[np.ndarray]:
-        """Capture frame in RGB format."""
+    def read(self, color: str = "rgb") -> Optional[np.ndarray]:
+        """
+        Capture frame.
+
+        color:
+          - "bgr": returns BGR (best for OpenCV drawing/imshow; avoids extra conversions)
+          - "rgb": returns RGB (best for MediaPipe)
+        """
         if not self.ready:
             return None
-        
+
+        color = (color or "rgb").lower()
+
         try:
             if self.backend == "picamera2":
                 frame = self.picam2.capture_array()
+                if frame is None or frame.size == 0:
+                    return None
+
                 # Picamera2 returns BGR despite RGB888 config
-                if frame is not None and frame.ndim == 3:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                return frame
-            
+                if color == "bgr":
+                    return frame
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
             elif self.backend == "opencv":
                 ret, frame = self.cap.read()
-                if ret and frame is not None:
-                    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                return None
-        
+                if not ret or frame is None:
+                    return None
+
+                if color == "bgr":
+                    return frame
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
         except Exception as e:
             log.debug("Capture error: %s", e)
             return None

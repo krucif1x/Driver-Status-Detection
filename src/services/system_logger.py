@@ -125,16 +125,63 @@ class SystemLogger:
         
         logging.info(f"🏁 log_event completed")
 
+    def signal(self, kind: str):
+        """
+        Finite buzzer signals (safe on machines without buzzer).
+        """
+        if not self.buzzer:
+            return
+
+        try:
+            k = (kind or "").lower()
+
+            if k == "startup":
+                # 2 short pulses
+                self.buzzer.pulse(0.15, background=True)
+                # slight delay then another pulse
+                import threading
+                threading.Timer(0.30, lambda: self.buzzer.pulse(0.15, background=True)).start()
+
+            elif k == "identity_prompt":
+                # short periodic beep for a moment
+                self.buzzer.beep_for(on_time=0.10, off_time=0.10, duration_sec=1.0)
+
+            elif k == "calibration_prompt":
+                # Requirement: 1s buzz intervals for 10 seconds
+                self.buzzer.beep_for(on_time=1.0, off_time=1.0, duration_sec=10.0)
+
+            elif k == "calibration_success":
+                # 3 short pulses
+                self.buzzer.pulse(0.12, background=True)
+                import threading
+                threading.Timer(0.25, lambda: self.buzzer.pulse(0.12, background=True)).start()
+                threading.Timer(0.50, lambda: self.buzzer.pulse(0.12, background=True)).start()
+
+            elif k == "calibration_fail":
+                # long beep
+                self.buzzer.pulse(0.8, background=True)
+
+            elif k == "drowsy":
+                # stronger pattern for a few seconds
+                self.buzzer.beep_for(on_time=0.25, off_time=0.10, duration_sec=2.5)
+
+            elif k == "distraction":
+                self.buzzer.beep_for(on_time=0.10, off_time=0.10, duration_sec=2.0)
+
+        except Exception:
+            return
+
     def alert(self, level: str = "warning"):
-        """Triggers buzzer. Fixed TypeError."""
-        if not self.buzzer: return
-        
-        if level == "warning":     
-            self.buzzer.beep(0.1, 0.1, background=True)
-        elif level == "critical":  
-            self.buzzer.beep(0.5, 0.5, background=True)
-        elif level == "distraction": 
-            self.buzzer.beep(0.1, 0.1, background=True)
+        """Backwards-compatible; uses finite patterns now."""
+        if not self.buzzer:
+            return
+        lvl = (level or "warning").lower()
+        if lvl == "critical":
+            self.signal("drowsy")
+        elif lvl == "distraction":
+            self.signal("distraction")
+        else:
+            self.buzzer.beep_for(0.10, 0.10, 1.5)
             
     def stop_alert(self):
         if self.buzzer: self.buzzer.off()
