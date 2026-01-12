@@ -1,5 +1,8 @@
 import logging
 from typing import Optional
+import os
+import signal
+import time
 
 import cv2
 
@@ -38,6 +41,11 @@ class DetectionLoop:
         self.face_mesh = face_mesh
         self.user_manager = user_manager
         self.logger = system_logger
+
+        # Headless mode (for systemd / no DISPLAY)
+        # Enable with: DS_HEADLESS=1
+        self.headless = str(os.getenv("DS_HEADLESS", "0")).strip().lower() in ("1", "true", "yes", "on")
+        self._stop_requested = False
 
         # UI kept separate (Visualizer handles drawing only)
         self.visualizer = Visualizer()
@@ -93,17 +101,36 @@ class DetectionLoop:
         self.recognition_patience = 0
         self.RECOGNITION_THRESHOLD = 45
 
+        if self.headless:
+            log.info("Headless mode enabled (DS_HEADLESS=1): GUI windows/keyboard controls disabled.")
+
+    def _request_stop(self, *_args):
+        self._stop_requested = True
+
     def run(self):
         log.info("Starting Detection Loop...")
+
+        # Allow clean shutdown from systemd: `systemctl stop ...` sends SIGTERM
         try:
-            while True:
+            signal.signal(signal.SIGTERM, self._request_stop)
+            signal.signal(signal.SIGINT, self._request_stop)
+        except Exception:
+            pass
+
+        try:
+            while not self._stop_requested:
                 self.process_frame()
 
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q") or key == 27:
-                    break
-                elif key == ord("d"):
-                    self._show_debug_deltas = not self._show_debug_deltas
+                # Only poll keyboard in non-headless (avoids Qt/xcb crash)
+                if not self.headless:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q") or key == 27:
+                        break
+                    elif key == ord("d"):
+                        self._show_debug_deltas = not self._show_debug_deltas
+                else:
+                    # tiny sleep to avoid busy looping if camera returns None frequently
+                    time.sleep(0.001)
         finally:
             try:
                 self.hand_wrapper.close()
@@ -114,7 +141,14 @@ class DetectionLoop:
                     self.logger.stop_alert()
             except Exception:
                 pass
-            cv2.destroyAllWindows()
+
+            # Only touch HighGUI in non-headless
+            if not self.headless:
+                try:
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
+
             self.camera.release()
 
     def process_frame(self):
@@ -158,7 +192,10 @@ class DetectionLoop:
             self.detection(frame_rgb, display, results, hands_norm, fps)
 
         self.visualizer.draw_mode(display, self.current_mode)
-        cv2.imshow("Drowsiness System", display)
+
+        # Only show window when not headless (prevents Qt "xcb" crash)
+        if not self.headless:
+            cv2.imshow("Drowsiness System", display)
 
     def _run_detectors(self, frame, features, hands_norm):
         expr = self.expression_classifier.classify(
@@ -306,10 +343,12 @@ class DetectionLoop:
 
         result_threshold = self.ear_calibrator.calibrate()
 
-        try:
-            cv2.destroyWindow("Calibration")
-        except Exception:
-            pass
+        # Only destroy GUI windows in non-headless
+        if not self.headless:
+            try:
+                cv2.destroyWindow("Calibration")
+            except Exception:
+                pass
 
         if result_threshold is not None and isinstance(result_threshold, float):
             log.info(f"Calibration Success. Threshold: {result_threshold:.3f}")
