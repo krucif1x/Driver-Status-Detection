@@ -1,8 +1,9 @@
 import numpy as np
 import logging
 from datetime import datetime
-from typing import List, Optional, Iterable, Any
+from typing import List
 from src.infrastructure.data.models import UserProfile, DrowsinessEvent
+
 
 class UnifiedRepository:
     MAX_USERS_IN_MEMORY = 1000
@@ -12,109 +13,94 @@ class UnifiedRepository:
 
     # --- USER PROFILE METHODS ---
     def load_all_users(self) -> List[UserProfile]:
-        rows = self.db.execute("""
-            SELECT id, user_id, ear_threshold, face_encoding
-            FROM user_profiles
-            ORDER BY last_seen DESC
-            LIMIT ?
-        """, (self.MAX_USERS_IN_MEMORY,), fetch=True) or []
-        
-        users = []
+        rows = (
+            self.db.execute(
+                """
+                SELECT id, user_id, ear_threshold, face_encoding
+                FROM user_profiles
+                ORDER BY last_seen DESC
+                LIMIT ?
+                """,
+                (self.MAX_USERS_IN_MEMORY,),
+                fetch=True,
+            )
+            or []
+        )
+
+        users: List[UserProfile] = []
         for pid, uid, ear, enc_blob in rows:
+            if enc_blob is None:
+                continue
             try:
                 enc = np.frombuffer(enc_blob, dtype=np.float32)
-                users.append(UserProfile(pid, uid, ear, enc))
+                users.append(UserProfile(pid, uid, float(ear), enc))
             except Exception as e:
-                logging.error(f"Failed to load user {uid}: {e}")
-        logging.info(f"Loaded {len(users)} user(s)")
+                logging.error("Failed to load user %s: %s", uid, e)
+
+        logging.info("Loaded %d user(s)", len(users))
         return users
 
     def save_user(self, user: UserProfile) -> int:
-        encoding_bytes = user.face_encoding.tobytes() if isinstance(user.face_encoding, np.ndarray) else user.face_encoding
-        rowid = self.db.execute("""
+        enc = np.asarray(user.face_encoding, dtype=np.float32).flatten()
+        encoding_bytes = enc.tobytes()
+
+        rowid = self.db.execute(
+            """
             INSERT INTO user_profiles (user_id, ear_threshold, face_encoding, last_seen)
             VALUES (?, ?, ?, ?)
-        """, (user.user_id, user.ear_threshold, encoding_bytes, datetime.now()))
+            """,
+            (int(user.user_id), float(user.ear_threshold), encoding_bytes, datetime.now()),
+        )
         return int(rowid)
 
     def update_last_seen(self, user_id: int):
-        self.db.execute("""
+        self.db.execute(
+            """
             UPDATE user_profiles SET last_seen = ? WHERE user_id = ?
-        """, (datetime.now(), user_id))
+            """,
+            (datetime.now(), int(user_id)),
+        )
 
     def get_next_user_id(self) -> int:
         try:
-            result = self.db.execute(
-                "SELECT MAX(user_id) FROM user_profiles",
-                fetch=True
-            )
+            result = self.db.execute("SELECT MAX(user_id) FROM user_profiles", fetch=True)
             max_id = result[0][0] if result and result[0][0] else 0
-            return max_id + 1
+            return int(max_id) + 1
         except Exception as e:
-            logging.error(f"Failed to get next user_id: {e}")
+            logging.error("Failed to get next user_id: %s", e)
             return 1
 
     # --- DROWSINESS EVENT METHODS ---
     def add_event(self, event: DrowsinessEvent) -> int:
         try:
-            logging.debug(f"🔍 Inserting event: {event.alert_category} - {event.alert_detail}")
-            
             rowid = self.db.execute(
                 """
                 INSERT INTO drowsiness_events
-                (vehicle_identification_number, user_id, time, status, img_drowsiness, 
+                (vehicle_identification_number, user_id, time, status, img_drowsiness,
                  duration, value, alert_category, alert_detail, severity)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.vehicle_identification_number,
-                    event.user_id,
+                    int(event.user_id),
                     event.time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(event.time, "strftime") else str(event.time),
                     event.status,
                     event.img_drowsiness,
-                    event.duration,
-                    event.value,
+                    float(event.duration),
+                    float(event.value),
                     event.alert_category,
                     event.alert_detail,
                     event.severity,
                 ),
             )
-            logging.info(f"✅ Event saved: row_id={rowid}, {event.alert_category} - {event.alert_detail} ({event.severity})")
+            logging.info(
+                "Event saved: row_id=%s, %s - %s (%s)",
+                rowid,
+                event.alert_category,
+                event.alert_detail,
+                event.severity,
+            )
             return int(rowid)
         except Exception as e:
-            logging.error(f"❌ Database Insert Failed: {e}", exc_info=True)
+            logging.error("Database Insert Failed: %s", e, exc_info=True)
             return -1
-
-    def get_all_events(self) -> list[tuple]:
-        return self.db.execute(
-            """
-            SELECT id, vehicle_identification_number, user_id, time, status, duration, value
-            FROM drowsiness_events
-            ORDER BY time DESC
-            """,
-            fetch=True
-        )
-
-    def get_events_by_user(self, user_id: int) -> list[tuple]:
-        return self.db.execute(
-            """
-            SELECT id, vehicle_identification_number, user_id, time, status, duration, value
-            FROM drowsiness_events
-            WHERE user_id = ?
-            ORDER BY time DESC
-            """,
-            (user_id,),
-            fetch=True
-        )
-
-    def get_events_by_vehicle(self, vin: str) -> list[tuple]:
-        return self.db.execute(
-            """
-            SELECT id, vehicle_identification_number, user_id, time, status, duration, value
-            FROM drowsiness_events
-            WHERE vehicle_identification_number = ?
-            ORDER BY time DESC
-            """,
-            (vin,),
-            fetch=True
-        )

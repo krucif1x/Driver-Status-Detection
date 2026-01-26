@@ -1,9 +1,9 @@
 import time
 from collections import deque
 
-from src.services.system_logger import SystemLogger
+from src.logging.system_logger import SystemLogger
 from src.status.drowsiness.config import load_drowsiness_config
-from src.status.drowsiness.events import log_drowsy_episode, log_yawn
+from src.status.drowsiness.rules import log_drowsy_episode, log_yawn
 
 
 class DrowsinessDetector:

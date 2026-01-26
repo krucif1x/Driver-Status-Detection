@@ -33,7 +33,7 @@ logging.getLogger("matplotlib").setLevel(logging.ERROR)
 try:
     # Updated Import Path: src.app -> src.core
     # Updated Class Name: DrowsinessApp -> DrowsinessSystem
-    from src.core.orchestrator import DrowsinessSystem
+    from src.app.orchestrator import DrowsinessSystem
     
     if __name__ == "__main__":
         app = DrowsinessSystem()

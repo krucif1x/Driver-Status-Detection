@@ -5,7 +5,7 @@ import numpy as np
 from datetime import datetime
 from typing import Optional
 
-from src.services.remote_logger import RemoteLogWorker
+from src.logging.remote_logger import RemoteLogWorker
 from src.infrastructure.data.repository import UnifiedRepository
 from src.infrastructure.data.models import DrowsinessEvent
 

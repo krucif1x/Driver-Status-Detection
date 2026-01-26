@@ -5,13 +5,13 @@ import os
 import numpy as np
 from pathlib import Path
 from src.infrastructure.hardware.camera import Camera
-from src.services.user_manager import UserManager
-from src.services.remote_logger import RemoteLogWorker
-from src.services.system_logger import SystemLogger
+from src.face_recognition.user_manager import UserManager
+from src.logging.remote_logger import RemoteLogWorker
+from src.logging.system_logger import SystemLogger
 from src.infrastructure.data.database import UnifiedDatabase
 from src.infrastructure.data.repository import UnifiedRepository
 from src.mediapipe.mediapipe_wrapper import MediaPipeFaceModel
-from src.core.detection_loop import DetectionLoop
+from src.app.detection_loop import DetectionLoop
 
 log = logging.getLogger(__name__)
 

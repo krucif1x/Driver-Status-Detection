@@ -77,6 +77,39 @@ class Buzzer:
         else:
             _run()
 
+    def pattern(self, on_time: float, off_time: float, count: int = 2, background: bool = True):
+        """Play a fixed number of beeps (count), then stop."""
+        if not self._buzzer:
+            return
+
+        def _run():
+            try:
+                n = max(0, int(count))
+                on = max(0.0, float(on_time))
+                off = max(0.0, float(off_time))
+                for i in range(n):
+                    try:
+                        self._buzzer.on()  # type: ignore[attr-defined]
+                    except Exception:
+                        return
+                    time.sleep(on)
+                    try:
+                        self._buzzer.off()  # type: ignore[attr-defined]
+                    except Exception:
+                        return
+                    if i != n - 1:
+                        time.sleep(off)
+            finally:
+                try:
+                    self._buzzer.off()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+        if background:
+            threading.Thread(target=_run, daemon=True).start()
+        else:
+            _run()
+
     def beep_for(self, on_time: float, off_time: float, duration_sec: float):
         """Beep pattern for a fixed duration, then stop."""
         if not self._buzzer:

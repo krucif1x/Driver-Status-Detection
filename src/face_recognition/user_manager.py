@@ -1,6 +1,8 @@
 import logging
 import torch
 import numpy as np
+import os
+import time
 from typing import List, Optional, Tuple
 from threading import Lock
 from collections import deque
@@ -8,15 +10,13 @@ from collections import deque
 from src.infrastructure.data.models import UserProfile
 from src.infrastructure.data.database import UnifiedDatabase
 from src.infrastructure.data.repository import UnifiedRepository
-from src.utils.face_recognition.model_loader import FaceModelLoader
-from src.utils.face_recognition.image_validator import ImageValidator
-from src.utils.face_recognition.encoding_extractor import FaceEncodingExtractor
-from src.utils.face_recognition.similarity_matcher import SimilarityMatcher
+from src.face_recognition.face_recognizer import FaceRecognizer
+from src.face_recognition.similarity_matcher import SimilarityMatcher
 
 class UserManager:
     def __init__(
         self, 
-        database_file: str = r"data\drowsiness_events.db",
+        database_file: str = "data/drowsiness_events.db",  # changed (POSIX-friendly)
         recognition_threshold: float = 0.5,  # Conservative threshold for better accuracy
         
         # Multi-frame validation reduces false positives significantly
@@ -28,6 +28,7 @@ class UserManager:
         
         input_color: str = "RGB"
     ):
+        database_file = os.path.normpath(database_file)  # changed: normalize separators
         logging.info(f"UserManager initializing with database: {database_file}")
         
         self.recognition_threshold = recognition_threshold
@@ -47,15 +48,10 @@ class UserManager:
         # Components with enhanced configuration
         self.db = UnifiedDatabase(database_file)
         self.repo = UnifiedRepository(self.db)
-        self.model_loader = FaceModelLoader(device=str(self.device))
-        self.validator = ImageValidator(self.input_color)
-        
-        # Enhanced encoder with configurable detection threshold
-        self.encoder = FaceEncodingExtractor(
-            self.model_loader, 
-            self.validator, 
-            self.device,
-            min_detection_prob=min_face_confidence
+        self.recognizer = FaceRecognizer(
+            device=self.device,
+            input_color=self.input_color,
+            min_detection_prob=min_face_confidence,
         )
         
         # Enhanced matcher with distance metric selection
@@ -72,6 +68,9 @@ class UserManager:
             'failed_matches': 0,
             'avg_match_distance': []
         }
+        
+        self._fr_log_last_ts = 0.0
+        self._fr_log_interval_sec = 2.0  # log at most once every 2 seconds
         
         self.load_users()
         logging.info(f"UserManager initialized successfully with threshold={recognition_threshold}")
@@ -100,6 +99,12 @@ class UserManager:
         confidence = 1.0 - (distance / threshold)
         return max(confidence, 0.0)
 
+    def _rate_limited_info(self, msg: str) -> None:
+        now = time.time()
+        if (now - self._fr_log_last_ts) >= self._fr_log_interval_sec:
+            self._fr_log_last_ts = now
+            logging.info(msg)
+
     def find_best_match(self, image_frame, use_metadata: bool = False) -> Optional[UserProfile]:
         """
         Find best matching user from image frame with enhanced validation.
@@ -115,14 +120,13 @@ class UserManager:
 
         # Extract encoding with optional metadata
         if use_metadata:
-            result = self.encoder.extract(image_frame, return_metadata=True)
-            if result[0] is None:
-                logging.debug(f"Extraction failed: {result[1]}")
+            encoding, metadata = self.recognizer.extract(image_frame, return_metadata=True)
+            if encoding is None:
+                logging.debug(f"Extraction failed: {metadata}")
                 return None
-            encoding, metadata = result
             logging.debug(f"Extraction metadata: {metadata}")
         else:
-            encoding = self.encoder.extract(image_frame)
+            encoding = self.recognizer.extract(image_frame)
             if encoding is None:
                 logging.debug("No face detected in frame")
                 return None
@@ -130,18 +134,27 @@ class UserManager:
         with self._lock:
             # Find best match with distance
             best_user, dist = self.matcher.best_match(
-                encoding, 
-                self.users, 
+                encoding,
+                self.users,
                 threshold=self.recognition_threshold
             )
-            
-            # Calculate confidence
             confidence = self.calculate_confidence_score(dist, self.recognition_threshold)
-            
-            # Update statistics
+
             self._match_stats['total_attempts'] += 1
-            if dist < self.recognition_threshold:
+            if best_user and dist < self.recognition_threshold:
                 self._match_stats['avg_match_distance'].append(dist)
+
+        # NEW: if rejected, clear recent history so we don't validate against stale frames
+        if (best_user is None) or (dist >= self.recognition_threshold):
+            if self.multi_frame_validation:
+                self._recent_matches.clear()
+            self._match_stats['failed_matches'] += 1
+            self._rate_limited_info(
+                f"✗ NO MATCH (Closest: User {best_user.user_id if best_user else 'N/A'}, "
+                f"Distance: {dist:.4f}, Confidence: {confidence:.2%}, "
+                f"Threshold: {self.recognition_threshold})"
+            )
+            return None
 
         # Multi-frame validation for consistency
         if self.multi_frame_validation and best_user:
@@ -168,7 +181,7 @@ class UserManager:
                 return None
 
         if best_user and dist < self.recognition_threshold:
-            logging.info(
+            self._rate_limited_info(
                 f"✓ MATCH FOUND: User ID {best_user.user_id} "
                 f"(Distance: {dist:.4f}, Confidence: {confidence:.2%}, "
                 f"Threshold: {self.recognition_threshold})"
@@ -207,7 +220,7 @@ class UserManager:
             return None
 
         # Extract encoding from primary frame
-        encoding = self.encoder.extract(image_frame)
+        encoding = self.recognizer.extract(image_frame)
         if encoding is None: 
             logging.error("Cannot register: No face encoding extracted from primary frame")
             return None
@@ -219,7 +232,7 @@ class UserManager:
             logging.info(f"Multi-frame registration with {len(additional_frames)} additional frames...")
             
             for frame in additional_frames:
-                enc = self.encoder.extract(frame)
+                enc = self.recognizer.extract(frame)
                 if enc is not None:
                     encodings.append(enc)
             
@@ -276,4 +289,3 @@ class UserManager:
             logging.error(f"✗ User registration failed: {e}")
             return None
 
-    

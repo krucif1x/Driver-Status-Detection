@@ -6,7 +6,7 @@ import time
 
 import cv2
 
-from src.calibration.main_logic import EARCalibrator
+from src.calibration.main_calibrator import EARCalibrator
 from src.core.status_aggregator import StatusAggregator
 from src.status.distraction.detector import DistractionDetector
 from src.status.drowsiness.detector import DrowsinessDetector
@@ -14,12 +14,12 @@ from src.status.expression import MouthExpressionClassifier
 from src.mediapipe.hand import MediaPipeHandsWrapper
 from src.mediapipe.head_pose import HeadPoseEstimator
 from src.utils.constants import L_EAR, M_MAR, R_EAR
+from src.utils.constants import LEFT_EYE, RIGHT_EYE  # add: canonical eye indices used in calibration
 from src.utils.ui.metrics_tracker import FpsTracker, RollingAverage
 from src.utils.ui.visualization import Visualizer
-from src.utils.calibration.calculation import MAR
-
+from src.calibration.ratios import MAR  # changed: MAR now lives in calibration/ratios.py
 from src.core.frame_processing import FrameProcessor, HandsPipeline
-from src.infrastructure.hardware.buzzer import Buzzer  # <-- buzzer lives here now
+from src.infrastructure.hardware.buzzer import Buzzer  
 
 log = logging.getLogger(__name__)
 
@@ -54,8 +54,14 @@ class DetectionLoop:
         # UI kept separate (Visualizer handles drawing only)
         self.visualizer = Visualizer()
 
-        # Calibration (inject logger for optional buzzer signals)
-        self.ear_calibrator = EARCalibrator(self.camera, self.face_mesh, self.user_manager, system_logger=self.logger)
+        # Calibration (inject logger + headless so it won't call imshow/waitKey on servers)
+        self.ear_calibrator = EARCalibrator(
+            self.camera,
+            self.face_mesh,
+            self.user_manager,
+            system_logger=self.logger,
+            headless=self.headless,  # changed
+        )
 
         # IMPORTANT: initialize cooldown fields
         self._post_calibration_cooldown = 0
@@ -63,6 +69,9 @@ class DetectionLoop:
         self._event_beep_cooldown = 0
         self._last_is_drowsy = False
         self._last_is_distracted = False
+
+        # NEW: separate cooldown for "state/UX" beeps (identity/calibration/etc.)
+        self._ui_beep_cooldown = 0
 
         # Identity prompt control + event cooldown (prevents buzzing every frame)
         self.detector = DrowsinessDetector(self.logger, fps, detector_config_path)
@@ -91,8 +100,8 @@ class DetectionLoop:
             ear_calculator=self.ear_calibrator.ear_calculator,
             mar_calculator=self.mar_calculator,
             ear_smoother=self.ear_smoother,
-            indices_left_ear=L_EAR,
-            indices_right_ear=R_EAR,
+            indices_left_ear=LEFT_EYE.ear,     # changed: match calibration
+            indices_right_ear=RIGHT_EYE.ear,   # changed: match calibration
             indices_mouth=M_MAR,
         )
 
@@ -110,6 +119,9 @@ class DetectionLoop:
         if self.headless:
             log.info("Headless mode enabled (DS_HEADLESS=1): GUI windows/keyboard controls disabled.")
 
+        self._fr_last_ts = 0.0
+        self._fr_interval_sec = 1.0  # run face-recognition at most once/sec
+
     def _request_stop(self, *_args):
         self._stop_requested = True
 
@@ -126,6 +138,45 @@ class DetectionLoop:
             return
         self.buzzer.beep_for(on_time=0.10, off_time=0.10, duration_sec=1.6)
         self._event_beep_cooldown = int(max(1, fps * 2))  # rate limit
+
+    def _buzz_identity_prompt(self):
+        if not self.buzzer or self._ui_beep_cooldown > 0:
+            return
+        # 2 short beeps = "please identify / look at camera"
+        self.buzzer.pattern(on_time=0.07, off_time=0.10, count=2, background=True)
+        self._ui_beep_cooldown = 30  # ~1s at 30fps (safe across fps)
+
+    def _buzz_user_identified(self):
+        if not self.buzzer:
+            return
+        # 3 quick beeps = "user found"
+        self.buzzer.pattern(on_time=0.05, off_time=0.08, count=3, background=True)
+
+    def _buzz_calibration_start(self):
+        if not self.buzzer:
+            return
+        # slow repeating = "calibration running"
+        self.buzzer.beep(on_time=0.05, off_time=0.45, background=True)
+
+    def _buzz_calibration_success(self):
+        if not self.buzzer:
+            return
+        self.buzzer.off()
+        # 2 medium beeps = "calibration ok"
+        self.buzzer.pattern(on_time=0.12, off_time=0.12, count=2, background=True)
+
+    def _buzz_calibration_fail(self):
+        if not self.buzzer:
+            return
+        self.buzzer.off()
+        # 1 longer beep = "calibration failed/cancelled"
+        self.buzzer.pattern(on_time=0.45, off_time=0.0, count=1, background=True)
+
+    def _buzz_shutdown(self):
+        if not self.buzzer:
+            return
+        # keep it short and blocking so it actually plays during teardown
+        self.buzzer.pattern(on_time=0.08, off_time=0.08, count=2, background=False)
 
     def run(self):
         log.info("Starting Detection Loop...")
@@ -152,6 +203,12 @@ class DetectionLoop:
                     # tiny sleep to avoid busy looping if camera returns None frequently
                     time.sleep(0.001)
         finally:
+            # NEW: audible shutdown indicator (best-effort)
+            try:
+                self._buzz_shutdown()
+            except Exception:
+                pass
+
             try:
                 self.buzzer.off()
             except Exception:
@@ -177,14 +234,19 @@ class DetectionLoop:
         if frame_bgr is None:
             return
 
-        # One-time identity prompt beep (safe if buzzer absent)
+        # Identity prompt beep (external indicator while waiting)
         if self.current_mode == "WAITING_FOR_USER" and not self._identity_prompted:
             self._identity_prompted = True
+            self._buzz_identity_prompt()
         if self.current_mode == "DETECTING":
             self._identity_prompted = False
 
         if self._event_beep_cooldown > 0:
             self._event_beep_cooldown -= 1
+
+        # NEW: cooldown for UI beeps
+        if self._ui_beep_cooldown > 0:
+            self._ui_beep_cooldown -= 1
 
         self._frame_idx += 1
         fps = self.fps_tracker.update()
@@ -323,7 +385,7 @@ class DetectionLoop:
             (features.pitch, features.yaw, features.roll),
         )
 
-    def face_recognition(self, frame, display, results):
+    def face_recognition(self, frame_rgb, display, results):
         # Safe even if attribute somehow missing
         self._post_calibration_cooldown = int(getattr(self, "_post_calibration_cooldown", 0))
         if self._post_calibration_cooldown > 0:
@@ -334,13 +396,25 @@ class DetectionLoop:
             self.recognition_patience = 0
             return
 
-        user = self.user_manager.find_best_match(frame)
+        # If we already have an active user, do NOT run face recognition every frame.
+        if self.user is not None and self.current_mode == "DETECTING":
+            return
+
+        now = time.time()
+        if (now - self._fr_last_ts) < self._fr_interval_sec:
+            return
+        self._fr_last_ts = now
+
+        user = self.user_manager.find_best_match(frame_rgb)
         if user:
             log.info(f"User identified: {user.user_id}")
             self.user = user
             self.detector.set_active_user(user)
             self.current_mode = "DETECTING"
             self.recognition_patience = 0
+
+            # NEW: audible confirmation
+            self._buzz_user_identified()
             return
 
         self.recognition_patience += 1
@@ -350,7 +424,7 @@ class DetectionLoop:
             return
 
         if self.recognition_patience >= self.RECOGNITION_THRESHOLD:
-            self.calibration(frame)
+            self.calibration(frame_rgb)
             return
 
     def calibration(self, frame):
@@ -362,20 +436,56 @@ class DetectionLoop:
         except Exception:
             pass
 
-        result_threshold = self.ear_calibrator.calibrate()
+        # NEW: audible "calibration running" indicator
+        self._buzz_calibration_start()
+
+        result = self.ear_calibrator.calibrate()
+
+        # Ensure calibration-running beep stops
+        try:
+            self.buzzer.off()
+        except Exception:
+            pass
 
         # Only destroy GUI windows in non-headless
         if not self.headless:
+            # main_calibrator/ui uses "Drowsiness System"
             try:
-                cv2.destroyWindow("Calibration")
+                cv2.destroyWindow("Drowsiness System")
             except Exception:
                 pass
+
+        # NEW: main_calibrator can return ("user_swap", user_profile)
+        if isinstance(result, tuple) and len(result) == 2 and result[0] == "user_swap":
+            user = result[1]
+            log.info(f"Calibration detected existing user. Switching to user_id={getattr(user, 'user_id', '?')}")
+            self.user = user
+            self.detector.set_active_user(user)
+            self.current_mode = "DETECTING"
+            self.recognition_patience = 0
+            self._post_calibration_cooldown = 45
+
+            # NEW: calibration ended + user identified
+            self._buzz_calibration_success()
+            self._buzz_user_identified()
+            return
+
+        result_threshold = result
 
         if result_threshold is not None and isinstance(result_threshold, float):
             log.info(f"Calibration Success. Threshold: {result_threshold:.3f}")
 
+            # NEW: calibration success beep
+            self._buzz_calibration_success()
+
             new_id = len(self.user_manager.users) + 1
-            fresh_frame = self.camera.read(color="rgb")
+
+            # Use RGB if camera supports it (consistent with face_recognition path)
+            try:
+                fresh_frame = self.camera.read(color="rgb")
+            except TypeError:
+                fresh_frame = self.camera.read()
+
             if fresh_frame is None:
                 fresh_frame = frame
 
@@ -387,12 +497,18 @@ class DetectionLoop:
                 self.detector.set_active_user(new_user)
                 self.current_mode = "DETECTING"
                 log.info("Switched to DETECTING mode after registration.")
+
+                # NEW: audible "user identified/ready"
+                self._buzz_user_identified()
             else:
                 log.error("Failed to register new user.")
                 self.current_mode = "WAITING_FOR_USER"
         else:
             log.warning("Calibration failed.")
             self.current_mode = "WAITING_FOR_USER"
+
+            # NEW: calibration failed/cancelled beep
+            self._buzz_calibration_fail()
 
         self.recognition_patience = 0
         self._post_calibration_cooldown = 45

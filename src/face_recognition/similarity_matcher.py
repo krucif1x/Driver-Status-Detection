@@ -1,6 +1,6 @@
 import numpy as np
 import logging
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 from src.infrastructure.data.models import UserProfile
 
 class SimilarityMatcher:
@@ -29,7 +29,7 @@ class SimilarityMatcher:
                 - "cosine": Cosine distance (alternative)
         """
         self._mat: Optional[np.ndarray] = None
-        self._user_ids: List[int] = []  # Track user IDs for debugging
+        self._users_with_encodings: List[UserProfile] = []
         self.distance_metric = distance_metric.lower()
         
         # Statistics
@@ -44,22 +44,24 @@ class SimilarityMatcher:
         logging.info(f"SimilarityMatcher initialized with {distance_metric} distance")
         
     def build_matrix(self, users: List[UserProfile]):
-        """Builds and normalizes the user encoding matrix for matching."""
-        if not users:
+        """Builds and normalizes the user encoding matrix for matching (keeps indices aligned)."""
+        filtered = [u for u in (users or []) if u.face_encoding is not None]
+        self._users_with_encodings = filtered
+
+        if not filtered:
             self._mat = None
-            self._user_ids = []
             return
-        encodings = [u.face_encoding for u in users if u.face_encoding is not None]
-        self._mat = np.array([e / (np.linalg.norm(e) + 1e-8) for e in encodings])
-        self._user_ids = [u.user_id for u in users]
+
+        enc = np.array([u.face_encoding for u in filtered], dtype=np.float32)
+        self._mat = enc / (np.linalg.norm(enc, axis=1, keepdims=True) + 1e-8)
 
     def best_match(
-        self, 
-        encoding: np.ndarray, 
-        users: List[UserProfile], 
+        self,
+        encoding: np.ndarray,
+        users: List[UserProfile],
         threshold: float = 0.60,
-        return_all_distances: bool = False
-    ) -> Tuple[Optional[UserProfile], float]:
+        return_all_distances: bool = False,
+    ) -> Union[Tuple[Optional[UserProfile], float], Tuple[Optional[UserProfile], float, np.ndarray]]:
         """
         Find best matching user for given encoding.
         
@@ -75,68 +77,52 @@ class SimilarityMatcher:
         Note: LOWER distance = BETTER match
         """
         self._stats['total_comparisons'] += 1
-        
-        # Validation
-        if not users or self._mat is None:
+
+        # Ensure matrix exists; build lazily if caller forgot
+        if self._mat is None or not self._users_with_encodings:
+            self.build_matrix(users)
+
+        if self._mat is None or not self._users_with_encodings:
             logging.debug("No users in database for matching")
-            return (None, 99.9, None) if return_all_distances else (None, 99.9)
-        
+            if return_all_distances:
+                return None, 99.9, np.array([], dtype=np.float32)
+            return None, 99.9
+
         if encoding is None or len(encoding) != 512:
             logging.warning(f"Invalid encoding for matching: {encoding.shape if encoding is not None else 'None'}")
-            return (None, 99.9, None) if return_all_distances else (None, 99.9)
-        
-        # Check for invalid values
+            if return_all_distances:
+                return None, 99.9, np.array([], dtype=np.float32)
+            return None, 99.9
+
         if np.isnan(encoding).any() or np.isinf(encoding).any():
             logging.warning("Encoding contains NaN or Inf values")
-            return (None, 99.9, None) if return_all_distances else (None, 99.9)
-        
-        # Normalize query encoding to unit vector
+            if return_all_distances:
+                return None, 99.9, np.array([], dtype=np.float32)
+            return None, 99.9
+
+        # Normalize query
         query = encoding / (np.linalg.norm(encoding) + 1e-8)
         
-        # Calculate distances using selected metric
-        if self.distance_metric == "cosine":
-            distances = self._cosine_distance(query)
-        else:  # euclidean (default)
-            distances = self._euclidean_distance(query)
+        # Calculate distances
+        distances = self._cosine_distance(query) if self.distance_metric == "cosine" else self._euclidean_distance(query)
         
-        # Find closest match
         best_idx = int(np.argmin(distances))
         best_distance = float(distances[best_idx])
         
-        # Log distance distribution for debugging
-        if len(distances) > 1:
-            logging.debug(
-                f"Distance stats - Best: {best_distance:.4f}, "
-                f"Mean: {np.mean(distances):.4f}, "
-                f"Std: {np.std(distances):.4f}, "
-                f"2nd Best: {np.partition(distances, 1)[1]:.4f}"
-            )
-        
-        # Check against threshold
         if best_distance <= threshold:
             self._stats['successful_matches'] += 1
             self._stats['avg_match_distance'].append(best_distance)
-            
-            matched_user = users[best_idx]
-            logging.debug(
-                f"✓ Match found: User {matched_user.user_id} "
-                f"(distance={best_distance:.4f}, threshold={threshold:.4f})"
-            )
-            
+
+            matched_user = self._users_with_encodings[best_idx]
             if return_all_distances:
                 return matched_user, best_distance, distances
             return matched_user, best_distance
-        else:
-            self._stats['failed_matches'] += 1
-            self._stats['avg_reject_distance'].append(best_distance)
-            
-            logging.debug(
-                f"✗ No match: Closest distance {best_distance:.4f} > threshold {threshold:.4f}"
-            )
-            
-            if return_all_distances:
-                return None, best_distance, distances
-            return None, best_distance
+
+        self._stats['failed_matches'] += 1
+        self._stats['avg_reject_distance'].append(best_distance)
+        if return_all_distances:
+            return None, best_distance, distances
+        return None, best_distance
 
     def _euclidean_distance(self, query: np.ndarray) -> np.ndarray:
         """

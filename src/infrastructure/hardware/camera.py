@@ -198,3 +198,49 @@ class Camera:
     def close(self):
         """Alias for release()."""
         self.release()
+        
+if __name__ == "__main__":
+    import sys
+    
+    # Konfigurasi Logging agar output terlihat
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    print("------------------------------------------------")
+    print("   Manual Camera Test (src/infrastructure/hardware/camera.py)")
+    print("------------------------------------------------")
+
+    # Inisialisasi Kamera (Auto-detect)
+    cam = Camera(source="auto", resolution=(640, 480))
+    
+    if not cam.ready:
+        log.error("Camera init failed. Exiting.")
+        sys.exit(1)
+
+    print("Camera initialized successfully.")
+    print("Press CTRL+C to stop the preview loop.")
+
+    try:
+        while True:
+            # Ambil frame dalam format BGR (untuk OpenCV imshow)
+            frame = cam.read(color="bgr")
+            
+            if frame is None:
+                log.warning("Empty frame received.")
+                time.sleep(0.1)
+                continue
+
+            cv2.imshow("Camera Manual Test", frame)
+            
+            # Tekan ESC atau 'q' untuk keluar
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord('q'):
+                print("Stopping...")
+                break
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+    except Exception as e:
+        log.error(f"Error in loop: {e}")
+    finally:
+        cam.release()
+        cv2.destroyAllWindows()
+        print("Camera released. Test finished.")
