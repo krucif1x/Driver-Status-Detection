@@ -40,13 +40,15 @@ class DetectionLoop:
         self.camera = camera
 
         # Own FaceMesh lifecycle here (no external injection)
+        # NOTE: refine_landmarks=True enables iris landmarks (adds 10 -> total 478 landmarks).
         self.face_mesh = FaceMeshModel(
             static_image_mode=False,
             max_num_faces=1,
-            refine_landmarks=True,
+            refine_landmarks=True,  # MUST be True for iris landmarks
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
+        log.info("FaceMeshModel initialized (refine_landmarks=%s -> iris landmarks enabled).", True)
 
         # Warmup once to avoid first-frame latency spikes
         try:
@@ -344,6 +346,7 @@ class DetectionLoop:
             "expr": expr,
             "drowsy_status": drowsy_status,
             "drowsy_color": drowsy_color,
+            "drowsy_state": drowsy_state, 
             "is_drowsy": is_drowsy,
             "is_distracted": is_distracted,
             "should_log_distraction": should_log_distraction,
@@ -404,6 +407,7 @@ class DetectionLoop:
             distraction_type=out["distraction_type"],
             should_log_distraction=out["should_log_distraction"],
             distraction_info=out["distraction_info"],
+            drowsiness_info=out.get("drowsy_state"),  # NEW
         )
 
         now_drowsy = bool(out.get("is_drowsy", False))
@@ -440,6 +444,7 @@ class DetectionLoop:
             )
 
         user_label = f"User {getattr(self.user, 'user_id', '?')}"
+        dstate = out.get("drowsy_state") or {}
         self.visualizer.draw_detection_hud(
             display,
             user_label,
@@ -448,9 +453,13 @@ class DetectionLoop:
             fps,
             features.avg_ear,  # display smoothed
             features.mar,
-            0,
+            int(dstate.get("blink_count", 0)),  # NEW: use real blink count
             out["expr"],
             (features.pitch, features.yaw, features.roll),
+            # NEW: hybrid-weighted HUD diagnostics
+            perclos=dstate.get("perclos"),
+            drowsy_score=dstate.get("drowsy_score"),
+            score_drowsy=dstate.get("score_drowsy"),
         )
 
     def face_recognition(self, frame_rgb, display, results):

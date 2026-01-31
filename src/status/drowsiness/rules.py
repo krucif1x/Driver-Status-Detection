@@ -27,3 +27,23 @@ def log_yawn(logger, user: Optional[Any], mar: float, frame: Any, alert_detail: 
         alert_detail=alert_detail,
         severity=severity,
     )
+
+
+def log_drowsy_score_on(
+    logger,
+    user: Optional[Any],
+    score: float,
+    perclos: float,
+    frame: Any,
+    severity: str = "Medium",
+) -> None:
+    logger.log_event(
+        getattr(user, "user_id", 0),
+        "DROWSY_SCORE_ON",
+        0.0,
+        float(score),
+        frame,
+        alert_category="Drowsiness",
+        alert_detail=f"Weighted score ON (score={score:.2f}, perclos={perclos:.2f})",
+        severity=severity,
+    )

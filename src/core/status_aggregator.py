@@ -8,6 +8,14 @@ from typing import Any, Dict, Optional, Tuple
 class FinalStatus:
     label: str
     color_bgr: Tuple[int, int, int]
+
+    # Optional: carry extra drowsiness diagnostics for HUD/telemetry (hybrid weighted)
+    drowsy_score: Optional[float] = None
+    perclos: Optional[float] = None
+    score_drowsy: Optional[bool] = None
+    eye_episode_active: Optional[bool] = None
+
+    # Distraction logging payload (existing)
     should_log_distraction: bool = False
     distraction_event_name: Optional[str] = None
     distraction_duration_sec: float = 0.0
@@ -19,7 +27,7 @@ class StatusAggregator:
     """
     Decide the single status to display/log based on detector outputs.
 
-    Priority (with fainting removed):
+    Priority:
         1) Drowsiness (DROWSY/YAWN/SLEEP)
         2) Distraction
         3) NORMAL
@@ -34,10 +42,20 @@ class StatusAggregator:
         distraction_type: str,
         should_log_distraction: bool,
         distraction_info: Optional[Dict[str, Any]],
+        # NEW (optional, non-breaking): allow passing hybrid-weighted internals to the UI
+        drowsiness_info: Optional[Dict[str, Any]] = None,
     ) -> FinalStatus:
         # Priority 1: Drowsiness
         if any(k in (drowsy_status or "") for k in ("DROWSY", "YAWN", "SLEEP")):
-            return FinalStatus(label=drowsy_status, color_bgr=drowsy_color_bgr)
+            info = drowsiness_info or {}
+            return FinalStatus(
+                label=drowsy_status,
+                color_bgr=drowsy_color_bgr,
+                drowsy_score=(float(info["drowsy_score"]) if "drowsy_score" in info and info["drowsy_score"] is not None else None),
+                perclos=(float(info["perclos"]) if "perclos" in info and info["perclos"] is not None else None),
+                score_drowsy=(bool(info["score_drowsy"]) if "score_drowsy" in info and info["score_drowsy"] is not None else None),
+                eye_episode_active=(bool(info["eye_episode_active"]) if "eye_episode_active" in info and info["eye_episode_active"] is not None else None),
+            )
 
         # Priority 2: Distraction
         if is_distracted:

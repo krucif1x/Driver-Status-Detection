@@ -10,6 +10,26 @@ system:
 
 detectors:
   drowsiness:
+    perclos:
+      window_sec: 30
+      threshold: 0.25
+
+    head_pose:
+      pitch_abs_threshold_deg: 18.0
+
+    score:
+      on_threshold: 0.65
+      off_threshold: 0.45
+      hold_sec: 0.5
+      release_sec: 1.0
+      hard_close_sec: 2.0
+      yawn_saturate_count: 3
+      weights:
+        perclos: 0.55
+        eyes_closed: 0.25
+        yawn: 0.15
+        pitch: 0.05
+
     episode:
       start_threshold_sec: 0.5
       end_grace_sec: 1.5

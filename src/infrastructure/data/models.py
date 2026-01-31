@@ -33,6 +33,10 @@ class DrowsinessEvent:
     img_drowsiness: Optional[str] = None
     img_path: Optional[str] = None
     duration: float = 0.0
+    # Primary numeric metric for this event:
+    # - DROWSY: min EAR during episode
+    # - YAWN: MAR at detection moment
+    # - DROWSY_SCORE_ON: drowsy_score (0..1)
     value: float = 0.0  # User's EAR threshold at time of event
     
     # Management-friendly fields (Power BI ready)

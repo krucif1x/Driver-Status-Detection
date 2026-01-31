@@ -112,6 +112,21 @@ class UnifiedDatabase:
                 """
             )
 
+            # --- NEW: outbox state column for remote delivery ---
+            # We must NOT reuse `events.status` for "pending/sent" because `status` is the event type.
+            try:
+                cur = conn.cursor()
+
+                cur.execute("PRAGMA table_info(events)")
+                cols = {row[1] for row in cur.fetchall()}  # row[1] == column name
+
+                if "delivery_status" not in cols:
+                    cur.execute("ALTER TABLE events ADD COLUMN delivery_status TEXT DEFAULT 'new'")
+                    conn.commit()
+            except Exception:
+                # Best-effort migration; logging is handled elsewhere in this file
+                pass
+
             # Indexes (use the NEW table name)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)")

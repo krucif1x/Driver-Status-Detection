@@ -18,11 +18,13 @@ class RemoteLogWorker:
     MAX_QUEUE_SIZE = 100
     SEND_BATCH_SIZE = 5
 
-    def __init__(self, db_path: str, remote_api_url: Optional[str] = None, enabled: bool = True):
+    def __init__(self, db_path: str, remote_api_url: Optional[str] = None, enabled: bool = True, require_image: bool = False):
         """
         db_path: path to the MAIN DB (contains users + events).
+        require_image: if True, do not send events without an image. For "events-only", keep False.
         """
         self.enabled = enabled
+        self.require_image = require_image
         self._db_lock = threading.Lock()
 
         target_base_url = remote_api_url if remote_api_url else config.SERVER_BASE_URL
@@ -46,27 +48,66 @@ class RemoteLogWorker:
             self._retry_thread = threading.Thread(target=self._retry_loop, daemon=True)
             self._retry_thread.start()
 
-    def send_or_queue(self, vehicle_vin: str, user_id: int, status: str,
-                      time_dt: datetime, raw_jpeg: Optional[bytes],
-                      alert_category: Optional[str] = None,
-                      alert_detail: Optional[str] = None,
-                      severity: Optional[str] = None,
-                      local_event_id: Optional[int] = None):
+    def send_or_queue(
+        self,
+        vehicle_vin: str,
+        user_id: int,
+        status: str,
+        time_dt: datetime,
+        raw_jpeg: Optional[bytes],
+        alert_category: Optional[str] = None,
+        alert_detail: Optional[str] = None,
+        severity: Optional[str] = None,
+        local_event_id: Optional[int] = None,
+        duration: Optional[float] = None,
+        value: Optional[float] = None,
+    ):
         """Push into immediate queue with new management fields."""
         if not (self.enabled and self.api_service):
             return
         try:
-            self._immediate_q.put_nowait((
-                vehicle_vin, user_id, status, time_dt, raw_jpeg,
-                alert_category, alert_detail, severity, local_event_id
-            ))
+            self._immediate_q.put_nowait(
+                (
+                    vehicle_vin,
+                    user_id,
+                    status,
+                    time_dt,
+                    raw_jpeg,
+                    alert_category,
+                    alert_detail,
+                    severity,
+                    local_event_id,
+                    duration,
+                    value,
+                )
+            )
         except queue.Full:
             log.warning("[REMOTE] Immediate queue full; marking pending in events")
-            self._queue(vehicle_vin, user_id, status, time_dt, raw_jpeg,
-                        alert_category, alert_detail, severity, local_event_id)
+            self._queue(
+                vehicle_vin,
+                user_id,
+                status,
+                time_dt,
+                raw_jpeg,
+                alert_category,
+                alert_detail,
+                severity,
+                local_event_id,
+            )
 
-    def _send_event(self, vin, uid, status, dt, jpeg_bytes,
-                    alert_category=None, alert_detail=None, severity=None) -> bool:
+    def _send_event(
+        self,
+        vin,
+        uid,
+        status,
+        dt,
+        jpeg_bytes,
+        alert_category=None,
+        alert_detail=None,
+        severity=None,
+        duration: Optional[float] = None,
+        value: Optional[float] = None,
+    ) -> bool:
         """Send to API; sanitize fields to avoid server-side 500s from null/bad values."""
         try:
             dt_obj = dt if isinstance(dt, datetime) else datetime.now()
@@ -81,65 +122,81 @@ class RemoteLogWorker:
             norm_detail = (alert_detail.strip() if isinstance(alert_detail, str) else alert_detail)
             norm_sev = (severity.strip() if isinstance(severity, str) else severity)
 
-            # If image is missing, do NOT send
-            if not jpeg_bytes:
+            # EVENTS-ONLY: allow sending without image
+            if self.require_image and not jpeg_bytes:
                 log.warning(
-                    "[REMOTE] Skip send (missing image): vin=%s uid=%s status=%r cat=%r sev=%r time=%s",
-                    vin, uid, norm_status, norm_cat, norm_sev, dt_obj.isoformat()
+                    "[REMOTE] Skip send (missing image; require_image=True): vin=%s uid=%s status=%r time=%s",
+                    vin, uid, norm_status, dt_obj.isoformat()
                 )
                 return False
 
-            b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+            b64 = None
+            if jpeg_bytes:
+                b64 = base64.b64encode(jpeg_bytes).decode("ascii")
 
             event = ApiEvent(
                 vehicle_identification_number=vin,
                 user_id=uid,
                 status=norm_status,
                 time=dt_obj,
-                img_drowsiness=b64,
-                img_path=None
+                img_drowsiness=b64,  # may be None (events-only)
+                img_path=None,
             )
 
+            # Optional fields (set only if server model supports them)
             if hasattr(event, "alert_category"):
                 event.alert_category = norm_cat
             if hasattr(event, "alert_detail"):
                 event.alert_detail = norm_detail
             if hasattr(event, "severity"):
                 event.severity = norm_sev
+            if hasattr(event, "duration") and duration is not None:
+                event.duration = float(duration)
+            if hasattr(event, "value") and value is not None:
+                event.value = float(value)
 
             res = self.api_service.send_drowsiness_event(event)
             if getattr(res, "success", False):
-                log.info(f"[REMOTE] ✓ Sent {norm_cat or norm_status} (CID: {getattr(res, 'correlation_id', '-')})")
+                log.info("[REMOTE] ✓ Sent %s (CID: %s)", norm_cat or norm_status, getattr(res, "correlation_id", "-"))
                 return True
 
             log.warning(
-                "[REMOTE] Send failed: error=%r status_code=%r vin=%s uid=%s status=%r cat=%r sev=%r time=%s",
+                "[REMOTE] Send failed: error=%r status_code=%r vin=%s uid=%s status=%r time=%s",
                 getattr(res, "error", "unknown error"),
                 getattr(res, "status_code", None),
-                vin, uid, norm_status, norm_cat, norm_sev, dt_obj.isoformat()
+                vin, uid, norm_status, dt_obj.isoformat()
             )
             return False
         except Exception as e:
-            log.error(f"[REMOTE] Send exception: {e}", exc_info=True)
+            log.error("[REMOTE] Send exception: %s", e, exc_info=True)
             return False
 
-    def _queue(self, vin, uid, status, dt, jpeg_bytes,
-               alert_category=None, alert_detail=None, severity=None,
-               local_event_id: Optional[int] = None):
-        """Use events table as the outbox (status=pending)."""
+    def _queue(
+        self,
+        vin,
+        uid,
+        status,
+        dt,
+        jpeg_bytes,
+        alert_category=None,
+        alert_detail=None,
+        severity=None,
+        local_event_id: Optional[int] = None,
+    ):
+        """Use events table as the outbox (delivery_status=pending)."""
         if local_event_id is None:
             log.warning("[REMOTE] No local_event_id; cannot mark pending in events")
             return
         try:
             with self._db_lock:
                 self.events_conn.execute(
-                    "UPDATE events SET status = ? WHERE id = ?",
+                    "UPDATE events SET delivery_status = ? WHERE id = ?",
                     ("pending", int(local_event_id)),
                 )
                 self.events_conn.commit()
             log.info("[REMOTE] ⧖ Marked pending: event_id=%s", local_event_id)
         except Exception as e:
-            log.error(f"[REMOTE] Queue error: {e}", exc_info=True)
+            log.error("[REMOTE] Queue error: %s", e, exc_info=True)
 
     def _fetch_local_jpeg(self, local_event_id: int) -> Optional[bytes]:
         """Fetch jpeg bytes from MAIN local events table."""
@@ -160,7 +217,7 @@ class RemoteLogWorker:
                 SELECT id, vehicle_identification_number, user_id, time, status,
                        img_drowsiness, duration, value, alert_category, alert_detail, severity
                 FROM events
-                WHERE status = ?
+                WHERE delivery_status = ?
                 ORDER BY id ASC
                 LIMIT ?
                 """,
@@ -170,20 +227,23 @@ class RemoteLogWorker:
         for (eid, vin, uid, time_str, status, img_blob, duration,
              value, alert_category, alert_detail, severity) in rows:
 
-            # If status is queue state, send event type from alert_category
-            payload_status = alert_category if status in ("pending", "sent") else status
-
             ok = self._send_event(
-                vin, uid, payload_status, time_str, img_blob,
+                vin,
+                uid,
+                status,         # IMPORTANT: status is the event type (do not replace it)
+                time_str,
+                img_blob,
                 alert_category=alert_category,
                 alert_detail=alert_detail,
                 severity=severity,
+                duration=duration,
+                value=value,
             )
 
             if ok:
                 with self._db_lock:
                     self.events_conn.execute(
-                        "UPDATE events SET status = ? WHERE id = ?",
+                        "UPDATE events SET delivery_status = ? WHERE id = ?",
                         ("sent", int(eid)),
                     )
                     self.events_conn.commit()
@@ -198,12 +258,35 @@ class RemoteLogWorker:
                 continue
 
             try:
-                vin, uid, status, dt, jpeg_bytes, alert_category, alert_detail, severity, local_event_id = item
+                (
+                    vin,
+                    uid,
+                    status,
+                    dt,
+                    jpeg_bytes,
+                    alert_category,
+                    alert_detail,
+                    severity,
+                    local_event_id,
+                    duration,
+                    value,
+                ) = item
 
                 if not jpeg_bytes and local_event_id:
                     jpeg_bytes = self._fetch_local_jpeg(local_event_id)
 
-                ok = self._send_event(vin, uid, status, dt, jpeg_bytes, alert_category, alert_detail, severity)
+                ok = self._send_event(
+                    vin,
+                    uid,
+                    status,
+                    dt,
+                    jpeg_bytes,
+                    alert_category=alert_category,
+                    alert_detail=alert_detail,
+                    severity=severity,
+                    duration=duration,
+                    value=value,
+                )
                 if not ok:
                     self._queue(vin, uid, status, dt, jpeg_bytes, alert_category, alert_detail, severity, local_event_id)
             except Exception as e:

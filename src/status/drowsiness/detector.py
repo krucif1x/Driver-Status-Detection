@@ -3,12 +3,22 @@ from collections import deque
 
 from src.logging.system_logger import SystemLogger
 from src.status.drowsiness.config import load_drowsiness_config
-from src.status.drowsiness.rules import log_drowsy_episode, log_yawn
+from src.status.drowsiness.rules import log_drowsy_episode, log_yawn, log_drowsy_score_on
+
+
+def _clamp01(x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    return float(x)
 
 
 class DrowsinessDetector:
     """
-    Detects drowsiness (low EAR over time) and yawning (MAR/expr/hands).
+    Detects drowsiness via a HYBRID approach:
+      - Rule/episode-based "eyes closed too long" (good for logging + clear events)
+      - Weighted score with hysteresis (robust multi-signal drowsiness)
     """
 
     def __init__(self, logger: SystemLogger, fps: float = 30.0, config_path: str = "config/detector_config.yaml"):
@@ -22,7 +32,7 @@ class DrowsinessDetector:
         self.ear_history = deque(maxlen=int(self.cfg["ear"]["history_frames"]))
         self.ear_drop_detected = False
 
-        # NEW: EAR smoothing + perclos history
+        # EAR smoothing + perclos history
         self._ear_ema = None
         self._eyes_closed_hist = deque(maxlen=int(self.cfg["perclos"]["window_frames"]))
         self._perclos = 0.0
@@ -40,7 +50,19 @@ class DrowsinessDetector:
             "YAWN_COOL": 0,
         }
 
-        self.states = {"IS_DROWSY": False, "IS_YAWNING": False, "EYES_CLOSED": False}
+        # NEW: separate score-based drowsiness state
+        self._drowsy_score = 0.0
+        self._score_on_cnt = 0
+        self._score_off_cnt = 0
+        self._score_drowsy = False
+
+        self.states = {
+            "IS_DROWSY": False,
+            "IS_YAWNING": False,
+            "EYES_CLOSED": False,
+            # NEW: more explicit internals
+            "EYE_EPISODE_ACTIVE": False,
+        }
         self.episode = {"active": False, "start_time": None, "min_ear": 1.0, "start_frame": None}
 
         self.yawn_timestamps = deque(maxlen=int(self.cfg["yawn"]["timestamps_max"]))
@@ -53,6 +75,7 @@ class DrowsinessDetector:
         self.user = user_profile
         base_ear = float(user_profile.ear_threshold) if user_profile else float(self.cfg["ear"]["low"])
 
+        # per-user baseline threshold stays valuable in a weighted system
         self.dynamic_ear_thresh = base_ear
         self.cfg["ear"]["low"] = base_ear
 
@@ -70,22 +93,25 @@ class DrowsinessDetector:
         self.ear_history.clear()
         self.yawn_timestamps.clear()
 
-        # NEW
         self._ear_ema = None
         self._eyes_closed_hist.clear()
         self._perclos = 0.0
+
+        self._drowsy_score = 0.0
+        self._score_on_cnt = 0
+        self._score_off_cnt = 0
+        self._score_drowsy = False
 
     def detect(self, ear, mar, expression, hands_data=None, face_center=None, pitch=None):
         ear = float(ear)
         mar = float(mar)
 
-        # NEW: smooth EAR (EMA)
+        # smooth EAR (EMA)
         alpha = float(self.cfg["ear"]["ema_alpha"])
         if self._ear_ema is None:
             self._ear_ema = ear
         else:
             self._ear_ema = (1.0 - alpha) * float(self._ear_ema) + alpha * ear
-
         ear_used = float(self._ear_ema)
 
         self.ear_history.append(ear_used)
@@ -94,18 +120,30 @@ class DrowsinessDetector:
         # closed decision uses low threshold on smoothed EAR
         self.states["EYES_CLOSED"] = ear_used < float(self.cfg["ear"]["low"])
 
-        # NEW: perclos update
+        # perclos update
         self._update_perclos(self.states["EYES_CLOSED"])
 
         self._update_suppression(expression)
         self._update_blink(ear_used)
-        self._update_drowsiness(ear_used)
+
+        # Keep the classic eye-closure episode logic (and its logging)
+        self._update_eye_episode(ear_used)
+
+        # Yawn detection (as before)
         self._update_yawn(mar, expression, hands_data, face_center)
+
+        # NEW: weighted/hybrid drowsiness decision
+        self._update_weighted_drowsiness_state(ear_used=ear_used, mar=mar, pitch=pitch)
+
+        # Final drowsy state = (episode) OR (score) OR (hard close)
+        hard_close = self.counters["EYES_CLOSED"] >= int(self.cfg["score"]["hard_close_frames"])
+        self.states["IS_DROWSY"] = bool(self.episode["active"] or self._score_drowsy or hard_close)
+        self.states["EYE_EPISODE_ACTIVE"] = bool(self.episode["active"])
 
         if self.states["IS_DROWSY"]:
             return "DROWSY", (0, 0, 255)
         if self.states["IS_YAWNING"]:
-            return "YAWNING", (0, 255, 255)
+            return "YAWN", (0, 255, 255)  # changed: was "YAWNING"
         return "NORMAL", (0, 255, 0)
 
     def _update_perclos(self, eyes_closed: bool) -> None:
@@ -133,7 +171,8 @@ class DrowsinessDetector:
             if self.counters["LAUGH_SUP"] > 0:
                 self.counters["LAUGH_SUP"] -= 1
 
-    def _update_drowsiness(self, ear: float):
+    # Renamed from _update_drowsiness: this now manages ONLY the eye-closure episode + logging.
+    def _update_eye_episode(self, ear: float):
         is_suppressed = self.counters["SMILE_SUP"] > 0 or self.counters["LAUGH_SUP"] > 0
 
         start_frames = int(self.cfg["episode"]["start_frames"])
@@ -141,11 +180,7 @@ class DrowsinessDetector:
         ear_low = float(self.cfg["ear"]["low"])
         ear_high = float(self.cfg["ear"]["high"])
 
-        # NEW: perclos trigger (window-based)
-        perclos_thr = float(self.cfg["perclos"]["threshold"])
-        perclos_active = (self._perclos >= perclos_thr)
-
-        # NEW: fast onset when sudden drop detected
+        # fast onset when sudden drop detected
         if self.ear_drop_detected:
             start_frames = max(1, int(start_frames * float(self.cfg["episode"]["drop_start_multiplier"])))
 
@@ -182,7 +217,7 @@ class DrowsinessDetector:
             else:
                 self.counters["RECOVERY"] = 0
 
-        elif (ear < ear_low or perclos_active) and not is_suppressed:
+        elif (ear < ear_low) and not is_suppressed:
             self.counters["DROWSINESS"] += 1
             if self.counters["DROWSINESS"] >= start_frames:
                 self.episode.update(
@@ -192,7 +227,93 @@ class DrowsinessDetector:
         else:
             self.counters["DROWSINESS"] = 0
 
-        self.states["IS_DROWSY"] = bool(self.episode["active"])
+    def _compute_drowsy_score(self, *, ear_used: float, mar: float, pitch) -> float:
+        w = self.cfg["score"]["weights"]
+        sum_w = float(w["perclos"] + w["eyes_closed"] + w["yawn"] + w["pitch"])
+        if sum_w <= 0.0:
+            return 0.0
+
+        # Term 1: PERCLOS normalized to its threshold
+        perclos_thr = float(self.cfg["perclos"]["threshold"])
+        perclos_term = _clamp01(float(self._perclos) / max(1e-6, perclos_thr))
+
+        # Term 2: eyes closed right now (fast responsiveness)
+        eyes_closed_term = 1.0 if self.states["EYES_CLOSED"] else 0.0
+
+        # Term 3: recent yawns (based on timestamps you already track)
+        now = time.time()
+        win = float(self.cfg["yawn"]["frequency_window_sec"])
+        recent_yawns = sum(1 for t in self.yawn_timestamps if now - t < win)
+        yawn_sat = max(1, int(self.cfg["score"]["yawn_saturate_count"]))
+        yawn_term = _clamp01(float(recent_yawns) / float(yawn_sat))
+
+        # Term 4: head pitch magnitude (optional; only if pitch is passed)
+        pitch_term = 0.0
+        try:
+            if pitch is not None:
+                thr = float(self.cfg["head_pose"]["pitch_abs_threshold_deg"])
+                pitch_term = _clamp01(abs(float(pitch)) / max(1e-6, thr))
+        except Exception:
+            pitch_term = 0.0
+
+        score = (
+            float(w["perclos"]) * perclos_term
+            + float(w["eyes_closed"]) * eyes_closed_term
+            + float(w["yawn"]) * yawn_term
+            + float(w["pitch"]) * pitch_term
+        ) / sum_w
+
+        return _clamp01(score)
+
+    def _update_weighted_drowsiness_state(self, *, ear_used: float, mar: float, pitch) -> None:
+        # Suppression reduces false positives during strong expressions
+        is_suppressed = self.counters["SMILE_SUP"] > 0 or self.counters["LAUGH_SUP"] > 0
+        if is_suppressed:
+            self._drowsy_score = 0.0
+            self._score_on_cnt = 0
+            self._score_off_cnt = 0
+            self._score_drowsy = False
+            return
+
+        score = self._compute_drowsy_score(ear_used=ear_used, mar=mar, pitch=pitch)
+        self._drowsy_score = float(score)
+
+        on_thr = float(self.cfg["score"]["on_threshold"])
+        off_thr = float(self.cfg["score"]["off_threshold"])
+        hold_frames = int(self.cfg["score"]["hold_frames"])
+        release_frames = int(self.cfg["score"]["release_frames"])
+
+        if self._score_drowsy:
+            if score < off_thr:
+                self._score_off_cnt += 1
+                if self._score_off_cnt >= release_frames:
+                    self._score_drowsy = False
+                    self._score_off_cnt = 0
+                    self._score_on_cnt = 0
+            else:
+                self._score_off_cnt = 0
+        else:
+            if score >= on_thr:
+                self._score_on_cnt += 1
+                if self._score_on_cnt >= hold_frames:
+                    self._score_drowsy = True
+                    self._score_on_cnt = 0
+                    self._score_off_cnt = 0
+
+                    # NEW: log weighted-score activation (event-only; no periodic logging)
+                    try:
+                        log_drowsy_score_on(
+                            self.logger,
+                            self.user,
+                            score=float(self._drowsy_score),
+                            perclos=float(self._perclos),
+                            frame=self._last_frame_rgb,
+                            severity="Medium",
+                        )
+                    except Exception:
+                        pass
+            else:
+                self._score_on_cnt = 0
 
     def _update_blink(self, ear: float):
         if ear < float(self.dynamic_ear_thresh):
@@ -228,7 +349,6 @@ class DrowsinessDetector:
                     covered = True
                     break
 
-        # NEW: if "covered", require MAR to be above a minimum to count as yawn evidence
         covered_mar_min = float(self.cfg["yawn"]["covered_mar_min"])
 
         if (expr == "YAWN") or (covered and mar >= covered_mar_min and expr not in ["SMILE", "LAUGH"]):
@@ -264,7 +384,6 @@ class DrowsinessDetector:
                 self.states["IS_YAWNING"] = True
 
     def get_detailed_state(self):
-        # NEW: simple trend estimate from ear history
         ear_trend = "STABLE"
         if len(self.ear_history) >= 6:
             delta = float(self.ear_history[-1]) - float(self.ear_history[-6])
@@ -277,7 +396,11 @@ class DrowsinessDetector:
             "is_drowsy": self.states["IS_DROWSY"],
             "is_yawning": self.states["IS_YAWNING"],
             "eyes_closed": self.states["EYES_CLOSED"],
+            "eye_episode_active": bool(self.episode["active"]),
             "blink_count": self.counters["BLINK"],
             "ear_trend": ear_trend,
             "perclos": float(self._perclos),
+            # NEW:
+            "drowsy_score": float(self._drowsy_score),
+            "score_drowsy": bool(self._score_drowsy),
         }

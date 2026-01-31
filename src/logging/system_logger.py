@@ -98,6 +98,8 @@ class SystemLogger:
                     alert_detail=alert_detail,
                     severity=severity,
                     local_event_id=local_rowid,
+                    duration=duration,  # NEW
+                    value=value,        # NEW
                 )
             except Exception as e:
                 logging.error("Failed to send event to remote: %s", e, exc_info=True)

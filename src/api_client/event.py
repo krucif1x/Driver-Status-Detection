@@ -28,6 +28,13 @@ class DrowsinessEvent:
     alert_detail: Optional[str] = None
     severity: Optional[str] = None
 
+    # NEW: event metrics (optional)
+    # - DROWSY: duration=episode seconds, value=min EAR
+    # - YAWN: duration=0, value=MAR
+    # - DROWSY_SCORE_ON: duration=0, value=score (0..1)
+    duration: Optional[float] = None
+    value: Optional[float] = None
+
     def _fmt_time(self) -> str:
         # Server expects "YYYY-MM-DD HH:MM:SS"
         return self.time.strftime("%Y-%m-%d %H:%M:%S")
@@ -48,11 +55,12 @@ class DrowsinessEvent:
             raise ValueError("vehicle_identification_number is required")
         if self.user_id is None or self.user_id < 0:
             raise ValueError("user_id must be a non-negative integer")
+
         status_norm = (self.status or "").strip().lower()
         if not status_norm:
             raise ValueError("status is required")
 
-        payload = {
+        payload: Dict[str, Any] = {
             "vehicle_identification_number": self.vehicle_identification_number,
             "user_id": int(self.user_id),
             "time": self._fmt_time(),
@@ -60,4 +68,17 @@ class DrowsinessEvent:
             "img_drowsiness": self.img_drowsiness,
             "img_path": self.img_path,
         }
+
+        # Optional extras (ONLY if present)
+        if self.alert_category is not None:
+            payload["alert_category"] = self.alert_category
+        if self.alert_detail is not None:
+            payload["alert_detail"] = self.alert_detail
+        if self.severity is not None:
+            payload["severity"] = self.severity
+        if self.duration is not None:
+            payload["duration"] = float(self.duration)
+        if self.value is not None:
+            payload["value"] = float(self.value)
+
         return payload
