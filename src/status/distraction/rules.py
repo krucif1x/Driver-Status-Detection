@@ -26,8 +26,10 @@ def determine_violation(
     dy = abs(yaw - cal_yaw)
 
     looking_aside = dy > yaw_thr
-    looking_down = dp > pitch_down_thr
-    looking_up = dp < -pitch_up_thr
+
+    # If your pose estimator defines +pitch as "looking up", then:
+    looking_up = dp > pitch_up_thr
+    looking_down = dp < -pitch_down_thr
 
     if is_drowsy and looking_down:
         return None, None, None, "Medium"

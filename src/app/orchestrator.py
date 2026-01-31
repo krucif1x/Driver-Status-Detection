@@ -2,15 +2,14 @@ import logging
 import cv2
 import yaml
 import os
-import numpy as np
 from pathlib import Path
+
 from src.infrastructure.hardware.camera import Camera
 from src.face_recognition.user_manager import UserManager
 from src.logging.remote_logger import RemoteLogWorker
 from src.logging.system_logger import SystemLogger
 from src.infrastructure.data.database import UnifiedDatabase
 from src.infrastructure.data.repository import UnifiedRepository
-from src.mediapipe.face_mesh import MediaPipeFaceModel
 from src.app.detection_loop import DetectionLoop
 
 log = logging.getLogger(__name__)
@@ -34,7 +33,6 @@ class DrowsinessSystem:
 
             DetectionLoop(
                 camera=self.camera,
-                face_mesh=self.face_mesh,
                 user_manager=self.user_manager,
                 system_logger=self.system_logger,
                 vehicle_vin=self.vin,
@@ -64,17 +62,11 @@ class DrowsinessSystem:
         if not self.camera.ready:
             raise RuntimeError("Camera failed to open")
 
-        # 4. AI Model (Warmup with generated black frame)
-        self.face_mesh = MediaPipeFaceModel(max_num_faces=1, refine_landmarks=True)
-        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        self.face_mesh.process(dummy_frame)
-
     def _cleanup(self):
         log.info("Shutting down...")
         if hasattr(self, 'remote_worker') and self.remote_worker: self.remote_worker.close()
         if hasattr(self, 'db') and self.db: self.db.close()
         if hasattr(self, 'camera') and self.camera: self.camera.release()
-        if hasattr(self, 'face_mesh') and self.face_mesh: self.face_mesh.close()
         cv2.destroyAllWindows()
 
     def _ensure_paths(self):

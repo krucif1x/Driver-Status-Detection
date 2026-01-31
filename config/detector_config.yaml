@@ -5,15 +5,9 @@ system:
   vin: "VIN-0001"
   target_fps: 30.0
 
-# Non-detector sections (kept here because other modules may rely on them)
-user:
-  swap_threshold: 0.8
+# Removed: user.swap_threshold (unused)
+# Removed: image.local_quality / image.remote_quality (not wired into SystemLogger)
 
-image:
-  local_quality: 85
-  remote_quality: 70
-
-# Detector-scoped configuration (source of truth for detector thresholds/behavior)
 detectors:
   drowsiness:
     episode:
@@ -41,8 +35,8 @@ detectors:
       timestamps_max: 10
 
     expression_suppression:
-      smile_suppress_sec: 0.5
-      laugh_suppress_sec: 0.67
+      smile_frames: 15
+      laugh_frames: 20
 
     severity:
       drowsiness:
@@ -70,4 +64,3 @@ detectors:
     severity:
       long_duration_high_sec: 3.0
 
-  

@@ -5,6 +5,7 @@ import signal
 import time
 
 import cv2
+import numpy as np
 
 from src.calibration.main_calibrator import EARCalibrator
 from src.core.status_aggregator import StatusAggregator
@@ -46,6 +47,13 @@ class DetectionLoop:
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
+
+        # Warmup once to avoid first-frame latency spikes
+        try:
+            dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+            self.face_mesh.process(dummy)
+        except Exception:
+            pass
 
         self.user_manager = user_manager
         self.logger = system_logger
